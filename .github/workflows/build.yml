@@ -134,23 +134,12 @@ jobs:
           echo "NEXT_TAG=$NEXT_TAG" >> "$GITHUB_ENV"
           echo "Tag - $NEXT_TAG" >> "$GITHUB_STEP_SUMMARY"
 
-  build-matrix:
-    name: Build application ${{ matrix.arch }}
+  build-amd64:
+    name: Build application amd64
     needs: [resolve-config]
-    strategy:
-      matrix:
-        include:
-          - arch: amd64
-            platform: linux/amd64
-            runner: ubuntu-latest
-          - arch: arm64
-            platform: linux/arm64
-            runner: ubuntu-24.04-arm
-
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubuntu-latest
     outputs:
-      amd64_digest: ${{ steps.digest_amd64.outputs.digest }}
-      arm64_digest: ${{ steps.digest_arm64.outputs.digest }}
+      amd64_digest: ${{ steps.digest.outputs.digest }}
 
     steps:
       - name: Checkout Code
@@ -163,9 +152,9 @@ jobs:
         uses: actions/cache@v3
         with:
           path: /tmp/.buildx-cache
-          key: ${{ runner.os }}-${{ matrix.arch }}-buildx-${{ github.event.inputs.pipeline_name }}-${{ github.ref_name }}
+          key: ${{ runner.os }}-amd64-buildx-${{ github.event.inputs.pipeline_name }}-${{ github.ref_name }}
           restore-keys: |
-            ${{ runner.os }}-${{ matrix.arch }}-buildx-${{ github.event.inputs.pipeline_name }}-
+            ${{ runner.os }}-amd64-buildx-${{ github.event.inputs.pipeline_name }}-
 
       - name: Log in to Docker Hub
         uses: docker/login-action@v2
@@ -173,68 +162,31 @@ jobs:
           username: ${{ env.DOCKER_USERNAME }}
           password: ${{ env.DOCKER_PASSWORD }}
 
-      - name: Build image for ${{ matrix.arch }}
+      - name: Build image for amd64
         run: |
           docker buildx build \
-            --platform ${{ matrix.platform }} \
+            --platform linux/amd64 \
             --build-arg WORK_DIR=${{ needs.resolve-config.outputs.work_dir }} \
             --file ${{ needs.resolve-config.outputs.dockerfile }} \
-            --tag ${{ env.DOCKER_USERNAME }}/${{ needs.resolve-config.outputs.image_name }}:${{ needs.resolve-config.outputs.tag }}-${{ matrix.arch }} \
+            --tag ${{ env.DOCKER_USERNAME }}/${{ needs.resolve-config.outputs.image_name }}:${{ needs.resolve-config.outputs.tag }} \
             --cache-from=type=local,src=/tmp/.buildx-cache \
             --cache-to=type=local,dest=/tmp/.buildx-cache,mode=max \
             --push \
-            --iidfile digest.txt \
             .
 
-      - name: Inspect Manifest List
+      - name: Inspect image
         run: |
-          docker buildx imagetools inspect ${{ env.DOCKER_USERNAME }}/${{ needs.resolve-config.outputs.image_name }}:${{ needs.resolve-config.outputs.tag }}-${{ matrix.arch }}
+          docker buildx imagetools inspect ${{ env.DOCKER_USERNAME }}/${{ needs.resolve-config.outputs.image_name }}:${{ needs.resolve-config.outputs.tag }}
 
-      - name: Export Digest (amd64)
-        if: matrix.arch == 'amd64'
-        id: digest_amd64
-        run: |
-          digest=$(docker buildx imagetools inspect \
-            ${{ env.DOCKER_USERNAME }}/${{ needs.resolve-config.outputs.image_name }}:${{ needs.resolve-config.outputs.tag }}-${{ matrix.arch }} \
-            --format '{{json .}}' | jq -r '.manifest.manifests[] | select(.platform.architecture=="amd64" and .platform.os=="linux") | .digest')
-          echo "digest=$digest" >> "$GITHUB_OUTPUT"
-
-      - name: Export Digest (arm64)
-        if: matrix.arch == 'arm64'
-        id: digest_arm64
+      - name: Export Digest
+        id: digest
         run: |
           digest=$(docker buildx imagetools inspect \
-            ${{ env.DOCKER_USERNAME }}/${{ needs.resolve-config.outputs.image_name }}:${{ needs.resolve-config.outputs.tag }}-${{ matrix.arch }} \
-            --format '{{json .}}' | jq -r '.manifest.manifests[] | select(.platform.architecture=="arm64" and .platform.os=="linux") | .digest')
+            ${{ env.DOCKER_USERNAME }}/${{ needs.resolve-config.outputs.image_name }}:${{ needs.resolve-config.outputs.tag }} \
+            --format '{{json .}}' | jq -r '.manifest.digest // .digest')
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
-
-  create-manifest:
-    name: Create and Push Manifest
-    needs: [build-matrix, resolve-config]
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v2
-        with:
-          username: ${{ env.DOCKER_USERNAME }}
-          password: ${{ env.DOCKER_PASSWORD }}
-
-      - name: Create and push manifest
-        run: |
-          docker manifest create ${{ env.DOCKER_USERNAME }}/${{ needs.resolve-config.outputs.image_name }}:${{ needs.resolve-config.outputs.tag }} \
-            --amend ${{ env.DOCKER_USERNAME }}/${{ needs.resolve-config.outputs.image_name }}@${{ needs.build-matrix.outputs.amd64_digest }} \
-            --amend ${{ env.DOCKER_USERNAME }}/${{ needs.resolve-config.outputs.image_name }}@${{ needs.build-matrix.outputs.arm64_digest }}
-
-          docker manifest push ${{ env.DOCKER_USERNAME }}/${{ needs.resolve-config.outputs.image_name }}:${{ needs.resolve-config.outputs.tag }}
-
-      - name: Cleanup local manifest refs
-        run: |
-          docker manifest rm ${{ env.DOCKER_USERNAME }}/${{ needs.resolve-config.outputs.image_name }}:${{ needs.resolve-config.outputs.tag }} || true
-          docker manifest rm ${{ env.DOCKER_USERNAME }}/${{ needs.resolve-config.outputs.image_name }}:${{ needs.resolve-config.outputs.tag }}-amd64 || true
-          docker manifest rm ${{ env.DOCKER_USERNAME }}/${{ needs.resolve-config.outputs.image_name }}:${{ needs.resolve-config.outputs.tag }}-arm64 || true
 
       - name: Add summary to GitHub Actions
         run: |
           echo "- Image: ${{ env.DOCKER_USERNAME }}/${{ needs.resolve-config.outputs.image_name }}:${{ needs.resolve-config.outputs.tag }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Platform: amd64, arm64" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Platform: amd64" >> "$GITHUB_STEP_SUMMARY"
