@@ -15,7 +15,7 @@ on:
           - sanitation-ui
 
 env:
-  DOCKER_USERNAME: ${{ vars.DOCKER_USERNAME }}
+  DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
   DOCKER_PASSWORD: ${{ secrets.DOCKER_ACCESS_TOKEN }}
 
 jobs:
@@ -23,10 +23,11 @@ jobs:
     name: Resolve ${{ github.event.inputs.pipeline_name }} config
     runs-on: ubuntu-latest
     outputs:
-      work_dir:    ${{ steps.setenv.outputs.work_dir }}
-      image_name:  ${{ steps.setenv.outputs.image_name }}
-      dockerfile:  ${{ steps.setenv.outputs.dockerfile }}
-      tag:         ${{ steps.tag.outputs.tag }}
+      work_dir: ${{ steps.setenv.outputs.work_dir }}
+      image_name: ${{ steps.setenv.outputs.image_name }}
+      dockerfile: ${{ steps.setenv.outputs.dockerfile }}
+      tag: ${{ steps.tag.outputs.tag }}
+
     steps:
       - name: Checkout Code
         uses: actions/checkout@v3
@@ -41,82 +42,97 @@ jobs:
       - name: Resolve env from build-config.yml
         id: setenv
         run: |
+          set -euo pipefail
+
           PIPELINE_NAME="${{ github.event.inputs.pipeline_name }}"
           DEFAULT_DOCKERFILE="Dockerfile"
-          echo "### Pipeline Name - $PIPELINE_NAME" >> $GITHUB_STEP_SUMMARY
 
-          # Find exactly one matching config block
+          echo "### Pipeline Name - $PIPELINE_NAME" >> "$GITHUB_STEP_SUMMARY"
+
           MATCHING_CONFIGS=$(yq eval -o=json '.config[] | select(.name | test("/'"$PIPELINE_NAME"'$"))' build/build-config.yml)
           MATCH_COUNT=$(echo "$MATCHING_CONFIGS" | jq -s 'length')
+
           if [ "$MATCH_COUNT" -ne 1 ]; then
             echo "ERROR: Expected exactly 1 matching pipeline config, but found $MATCH_COUNT"
             exit 1
           fi
 
-          # Extract fields
           SERVICE_BUILD_CONFIG=$(echo "$MATCHING_CONFIGS" | jq -c '.build[] | select(.["image-name"])')
           SERVICE_WORK_DIR=$(echo "$SERVICE_BUILD_CONFIG" | yq eval -r '.["work-dir"] // ""' -)
           SERVICE_IMAGE_NAME=$(echo "$SERVICE_BUILD_CONFIG" | yq eval -r '.["image-name"] // ""' -)
           SERVICE_DOCKERFILE=$(echo "$SERVICE_BUILD_CONFIG" | yq eval -r '.dockerfile // ""' -)
 
-          # Default Dockerfile if none specified
+          if [ -z "$SERVICE_WORK_DIR" ] || [ -z "$SERVICE_IMAGE_NAME" ]; then
+            echo "ERROR: work-dir or image-name could not be resolved from build-config.yml"
+            exit 1
+          fi
+
           if [ -z "$SERVICE_DOCKERFILE" ]; then
             SERVICE_DOCKERFILE="$SERVICE_WORK_DIR/$DEFAULT_DOCKERFILE"
           fi
 
-          # Export
           echo "SERVICE_WORK_DIR=$SERVICE_WORK_DIR" >> "$GITHUB_ENV"
           echo "SERVICE_IMAGE_NAME=$SERVICE_IMAGE_NAME" >> "$GITHUB_ENV"
           echo "SERVICE_DOCKERFILE=$SERVICE_DOCKERFILE" >> "$GITHUB_ENV"
-          echo "work_dir=$SERVICE_WORK_DIR" >> $GITHUB_OUTPUT
-          echo "image_name=$SERVICE_IMAGE_NAME" >> $GITHUB_OUTPUT
-          echo "dockerfile=$SERVICE_DOCKERFILE" >> $GITHUB_OUTPUT
-          
-          # Put summary for the step
-          echo "#### Application Config Summary" >> $GITHUB_STEP_SUMMARY
-          echo "Application Work Directory - $SERVICE_WORK_DIR" >> $GITHUB_STEP_SUMMARY
-          echo "Image Name - $SERVICE_IMAGE_NAME" >> $GITHUB_STEP_SUMMARY
-          echo "Dockerfile Path - $SERVICE_DOCKERFILE" >> $GITHUB_STEP_SUMMARY
+
+          echo "work_dir=$SERVICE_WORK_DIR" >> "$GITHUB_OUTPUT"
+          echo "image_name=$SERVICE_IMAGE_NAME" >> "$GITHUB_OUTPUT"
+          echo "dockerfile=$SERVICE_DOCKERFILE" >> "$GITHUB_OUTPUT"
+
+          echo "#### Application Config Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "Application Work Directory - $SERVICE_WORK_DIR" >> "$GITHUB_STEP_SUMMARY"
+          echo "Image Name - $SERVICE_IMAGE_NAME" >> "$GITHUB_STEP_SUMMARY"
+          echo "Dockerfile Path - $SERVICE_DOCKERFILE" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Generate the Next Tag
         id: tag
         run: |
-          set -euxo pipefail
-          BRANCH="${GITHUB_REF##*/}"
-          COMMIT_HASH=$(git rev-parse --short HEAD)
-          SERVICE_NAME="${{ env.SERVICE_IMAGE_NAME }}"
+          set -euo pipefail
 
-          TOKEN=$(curl -s -X POST "https://hub.docker.com/v2/users/login/" \
-            -H "Content-Type: application/json" \
-            -d "{\"username\": \"$DOCKER_USERNAME\", \"password\": \"$DOCKER_PASSWORD\"}" \
-            | jq -r .token)
+          BRANCH="${GITHUB_REF_NAME}"
+          COMMIT_HASH="$(git rev-parse --short HEAD)"
+          SERVICE_NAME="${{ steps.setenv.outputs.image_name }}"
+          REGISTRY_OWNER="${DOCKER_USERNAME}"
 
-          if [ -z "$TOKEN" ]; then
-            echo "Failed to authenticate with Docker Hub." >&2
+          if [ -z "${DOCKER_USERNAME:-}" ] || [ -z "${DOCKER_PASSWORD:-}" ]; then
+            echo "ERROR: DOCKER_USERNAME or DOCKER_PASSWORD is missing."
             exit 1
           fi
 
-          # Check if repo exists
+          TOKEN=$(curl -fsS -X POST "https://hub.docker.com/v2/users/login/" \
+            -H "Content-Type: application/json" \
+            -d "{\"username\":\"$DOCKER_USERNAME\",\"password\":\"$DOCKER_PASSWORD\"}" \
+            | jq -r '.token // empty')
+
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+            echo "ERROR: Failed to authenticate with Docker Hub."
+            exit 1
+          fi
+
           HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' \
             -H "Authorization: JWT $TOKEN" \
-            "https://hub.docker.com/v2/repositories/$DOCKER_USERNAME/$SERVICE_NAME/")
+            "https://hub.docker.com/v2/repositories/${REGISTRY_OWNER}/${SERVICE_NAME}/")
 
           if [ "$HTTP_CODE" -ne 200 ]; then
             NEXT_TAG="${BRANCH}-${COMMIT_HASH}"
           else
-            EXISTING_TAGS=$(curl -s -H "Authorization: JWT $TOKEN" \
-              "https://hub.docker.com/v2/repositories/$DOCKER_USERNAME/$SERVICE_NAME/tags?page_size=100" \
-              | jq -r '.results[].name')
+            RESPONSE=$(curl -fsS \
+              -H "Authorization: JWT $TOKEN" \
+              "https://hub.docker.com/v2/repositories/${REGISTRY_OWNER}/${SERVICE_NAME}/tags?page_size=100")
+
+            EXISTING_TAGS=$(echo "$RESPONSE" | jq -r '.results[]?.name // empty')
+
             LATEST_TAG=$(echo "$EXISTING_TAGS" \
               | grep "^${BRANCH}-${COMMIT_HASH}" || true \
               | sort -V \
               | tail -n 1)
+
             NEXT_TAG="${LATEST_TAG:-${BRANCH}-${COMMIT_HASH}}"
           fi
 
           echo "tag=$NEXT_TAG" >> "$GITHUB_OUTPUT"
           echo "NEXT_TAG=$NEXT_TAG" >> "$GITHUB_ENV"
-          echo "tag - $NEXT_TAG" >> $GITHUB_STEP_SUMMARY
+          echo "Tag - $NEXT_TAG" >> "$GITHUB_STEP_SUMMARY"
 
   build-matrix:
     name: Build application ${{ matrix.arch }}
@@ -130,10 +146,12 @@ jobs:
           - arch: arm64
             platform: linux/arm64
             runner: ubuntu-24.04-arm
+
     runs-on: ${{ matrix.runner }}
     outputs:
       amd64_digest: ${{ steps.digest_amd64.outputs.digest }}
       arm64_digest: ${{ steps.digest_arm64.outputs.digest }}
+
     steps:
       - name: Checkout Code
         uses: actions/checkout@v3
@@ -161,7 +179,7 @@ jobs:
             --platform ${{ matrix.platform }} \
             --build-arg WORK_DIR=${{ needs.resolve-config.outputs.work_dir }} \
             --file ${{ needs.resolve-config.outputs.dockerfile }} \
-            --tag egovio/${{ needs.resolve-config.outputs.image_name }}:${{ needs.resolve-config.outputs.tag }}-${{ matrix.arch }} \
+            --tag ${{ env.DOCKER_USERNAME }}/${{ needs.resolve-config.outputs.image_name }}:${{ needs.resolve-config.outputs.tag }}-${{ matrix.arch }} \
             --cache-from=type=local,src=/tmp/.buildx-cache \
             --cache-to=type=local,dest=/tmp/.buildx-cache,mode=max \
             --push \
@@ -170,30 +188,31 @@ jobs:
 
       - name: Inspect Manifest List
         run: |
-          docker buildx imagetools inspect egovio/${{ needs.resolve-config.outputs.image_name }}:${{ needs.resolve-config.outputs.tag }}-${{ matrix.arch }}
+          docker buildx imagetools inspect ${{ env.DOCKER_USERNAME }}/${{ needs.resolve-config.outputs.image_name }}:${{ needs.resolve-config.outputs.tag }}-${{ matrix.arch }}
 
       - name: Export Digest (amd64)
         if: matrix.arch == 'amd64'
         id: digest_amd64
         run: |
           digest=$(docker buildx imagetools inspect \
-            egovio/${{ needs.resolve-config.outputs.image_name }}:${{ needs.resolve-config.outputs.tag }}-${{ matrix.arch }} \
+            ${{ env.DOCKER_USERNAME }}/${{ needs.resolve-config.outputs.image_name }}:${{ needs.resolve-config.outputs.tag }}-${{ matrix.arch }} \
             --format '{{json .}}' | jq -r '.manifest.manifests[] | select(.platform.architecture=="amd64" and .platform.os=="linux") | .digest')
-          echo "digest=$digest" >> $GITHUB_OUTPUT
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
       - name: Export Digest (arm64)
         if: matrix.arch == 'arm64'
         id: digest_arm64
         run: |
           digest=$(docker buildx imagetools inspect \
-            egovio/${{ needs.resolve-config.outputs.image_name }}:${{ needs.resolve-config.outputs.tag }}-${{ matrix.arch }} \
+            ${{ env.DOCKER_USERNAME }}/${{ needs.resolve-config.outputs.image_name }}:${{ needs.resolve-config.outputs.tag }}-${{ matrix.arch }} \
             --format '{{json .}}' | jq -r '.manifest.manifests[] | select(.platform.architecture=="arm64" and .platform.os=="linux") | .digest')
-          echo "digest=$digest" >> $GITHUB_OUTPUT
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
   create-manifest:
     name: Create and Push Manifest
     needs: [build-matrix, resolve-config]
     runs-on: ubuntu-latest
+
     steps:
       - name: Log in to Docker Hub
         uses: docker/login-action@v2
@@ -203,17 +222,19 @@ jobs:
 
       - name: Create and push manifest
         run: |
-          docker manifest create egovio/${{ needs.resolve-config.outputs.image_name }}:${{ needs.resolve-config.outputs.tag }} \
-            --amend egovio/${{ needs.resolve-config.outputs.image_name }}@${{ needs.build-matrix.outputs.amd64_digest }} \
-            --amend egovio/${{ needs.resolve-config.outputs.image_name }}@${{ needs.build-matrix.outputs.arm64_digest }}
-          docker manifest push egovio/${{ needs.resolve-config.outputs.image_name }}:${{ needs.resolve-config.outputs.tag }}
+          docker manifest create ${{ env.DOCKER_USERNAME }}/${{ needs.resolve-config.outputs.image_name }}:${{ needs.resolve-config.outputs.tag }} \
+            --amend ${{ env.DOCKER_USERNAME }}/${{ needs.resolve-config.outputs.image_name }}@${{ needs.build-matrix.outputs.amd64_digest }} \
+            --amend ${{ env.DOCKER_USERNAME }}/${{ needs.resolve-config.outputs.image_name }}@${{ needs.build-matrix.outputs.arm64_digest }}
+
+          docker manifest push ${{ env.DOCKER_USERNAME }}/${{ needs.resolve-config.outputs.image_name }}:${{ needs.resolve-config.outputs.tag }}
 
       - name: Cleanup local manifest refs
         run: |
-          docker manifest rm egovio/${{ needs.resolve-config.outputs.image_name }}:${{ needs.resolve-config.outputs.tag }}-amd64 || true
-          docker manifest rm egovio/${{ needs.resolve-config.outputs.image_name }}:${{ needs.resolve-config.outputs.tag }}-arm64 || true
+          docker manifest rm ${{ env.DOCKER_USERNAME }}/${{ needs.resolve-config.outputs.image_name }}:${{ needs.resolve-config.outputs.tag }} || true
+          docker manifest rm ${{ env.DOCKER_USERNAME }}/${{ needs.resolve-config.outputs.image_name }}:${{ needs.resolve-config.outputs.tag }}-amd64 || true
+          docker manifest rm ${{ env.DOCKER_USERNAME }}/${{ needs.resolve-config.outputs.image_name }}:${{ needs.resolve-config.outputs.tag }}-arm64 || true
 
       - name: Add summary to GitHub Actions
         run: |
-          echo "- Image: egovio/${{ needs.resolve-config.outputs.image_name }}:${{ needs.resolve-config.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Platform: amd64, arm64" >> $GITHUB_STEP_SUMMARY
+          echo "- Image: ${{ env.DOCKER_USERNAME }}/${{ needs.resolve-config.outputs.image_name }}:${{ needs.resolve-config.outputs.tag }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Platform: amd64, arm64" >> "$GITHUB_STEP_SUMMARY"
