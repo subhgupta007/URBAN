@@ -3,8 +3,6 @@ FROM node:14.21.3-alpine AS build
 RUN apk update && apk upgrade \
     && apk add --no-cache git bash
 
-RUN npm install -g yarn@1.22.19
-
 ARG WORK_DIR
 WORKDIR /app
 
