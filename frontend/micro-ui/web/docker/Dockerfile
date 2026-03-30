@@ -18,6 +18,8 @@ RUN cd web/ \
     && node -e 'console.log(v8.getHeapStatistics().heap_size_limit/(1024*1024))' \
     && chmod +x install-deps.sh \
     && ./install-deps.sh \
+    && rm -rf node_modules yarn.lock \
+    && yarn cache clean \
     && yarn install --ignore-engines \
     && yarn build:webpack
 
