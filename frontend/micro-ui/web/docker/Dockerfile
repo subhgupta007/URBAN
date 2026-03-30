@@ -1,8 +1,9 @@
-FROM egovio/alpine-node-builder-14:yarn AS build
-# FROM ghcr.io/egovernments/alpine-node-builder-14:yarn AS build
+FROM node:14.21.3-alpine AS build
 
-RUN apk update && apk upgrade
-RUN apk add --no-cache git bash
+RUN apk update && apk upgrade \
+    && apk add --no-cache git bash
+
+RUN npm install -g yarn@1.22.19
 
 ARG WORK_DIR
 WORKDIR /app
@@ -14,17 +15,16 @@ COPY ${WORK_DIR} .
 RUN ls -lah
 
 RUN cd web/ \
+    && node --version \
+    && yarn --version \
     && node envs.js \
     && node -e 'console.log(v8.getHeapStatistics().heap_size_limit/(1024*1024))' \
     && chmod +x install-deps.sh \
-    && yarn install --ignore-engines \
-    && ./install-deps.sh || true \
-    && yarn workspace @egovernments/digit-ui-react-components build || true \
-    && yarn workspace @egovernments/digit-ui-libraries build || true \
+    && ./install-deps.sh \
+    && yarn install \
     && yarn build:webpack
 
 FROM nginx:mainline-alpine
-# FROM ghcr.io/egovernments/nginx:mainline-alpine
 
 ENV WORK_DIR="/var/web/digit-ui"
 
